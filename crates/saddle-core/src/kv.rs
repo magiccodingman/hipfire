@@ -859,36 +859,49 @@ impl KvCache {
     }
 
     /// Non-owning view of one lane inside a parent contiguous Q8 cache.
+    pub fn q8_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
+        if !self.quant_q8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view requires a contiguous Q8 cache",
+            ));
+        }
+        self.continuous_batch_lane_view(lane, lane_capacity)
+    }
+
+    /// Non-owning view of one lane inside a parent contiguous Q8 or
+    /// FWHT3-K/Q8-V cache.
     ///
     /// `self` must have been allocated with total physical capacity
     /// `lanes * lane_capacity`. The returned cache presents ordinary
-    /// single-sequence Q8 addressing, so existing prefill kernels can seed one
+    /// single-sequence addressing, so existing prefill kernels can seed one
     /// lane without copying weights or allocating a second cache. The view must
     /// never be passed to [`KvCache::free_gpu`].
     ///
-    /// Rejects asym / FWHT / INT8 / HFQ4 / VMM layouts rather than fabricating
-    /// support: continuous-batch only targets exact contiguous Q8 HIP.
-    pub fn q8_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
-        if !self.quant_q8
+    /// Rejects all other quantized / VMM layouts rather than fabricating
+    /// support. The FWHT3 case retains separate K/V strides and aliases the
+    /// cache's sign tables into the lane view.
+    pub fn continuous_batch_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
+        let q8 = self.quant_q8 && !self.quant_asym3 && !self.quant_fwht && self.v_mode == VMode::Q8;
+        let fwht3 =
+            !self.quant_q8 && self.quant_asym3 && self.quant_fwht && self.v_mode == VMode::Q8;
+        if !(q8 || fwht3)
             || self.quant_int8
             || self.quant_hfq4
             || self.quant_asym4
-            || self.quant_asym3
             || self.quant_asym2
-            || self.quant_fwht
-            || self.v_mode != VMode::Q8
             || lane_capacity == 0
         {
             return Err(hip_bridge::HipError::new(
                 0,
-                "q8_lane_view requires a contiguous Q8 cache and non-zero lane capacity",
+                "continuous_batch_lane_view requires contiguous Q8 or FWHT3-K/Q8-V storage and non-zero lane capacity",
             ));
         }
         if self.head_dim == 0 || !self.head_dim.is_multiple_of(32) {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "q8_lane_view requires head_dim divisible by 32 (got {})",
+                    "continuous_batch_lane_view requires head_dim divisible by 32 (got {})",
                     self.head_dim
                 ),
             ));
@@ -899,40 +912,47 @@ impl KvCache {
             if t.buf.is_vmm_owner() {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "q8_lane_view does not support VMM-backed KV caches",
+                    "continuous_batch_lane_view does not support VMM-backed KV caches",
                 ));
             }
         }
         let lane_end = lane
             .checked_add(1)
             .and_then(|n| n.checked_mul(lane_capacity))
-            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view capacity overflow"))?;
+            .ok_or_else(|| hip_bridge::HipError::new(0, "lane view capacity overflow"))?;
         if lane_end > self.physical_cap {
             return Err(hip_bridge::HipError::new(
                 0,
                 "q8_lane_view lane exceeds backing cache capacity",
             ));
         }
-        let blocks_per_pos = self
+        let q8_blocks_per_pos = self
             .n_kv_heads
             .checked_mul(self.head_dim / 32)
-            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view blocks_per_pos overflow"))?;
-        let bytes_per_pos = blocks_per_pos
+            .ok_or_else(|| hip_bridge::HipError::new(0, "lane view blocks_per_pos overflow"))?;
+        let q8_bytes_per_pos = q8_blocks_per_pos
             .checked_mul(34)
-            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view bytes_per_pos overflow"))?;
-        let byte_offset = lane
-            .checked_mul(lane_capacity)
-            .and_then(|n| n.checked_mul(bytes_per_pos))
-            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view byte_offset overflow"))?;
-        let lane_bytes = lane_capacity
-            .checked_mul(bytes_per_pos)
-            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view lane_bytes overflow"))?;
-        let lane_elems = Self::bytes_to_f32_elems("q8_lane_view lane", lane_bytes)?;
-        let view = |t: &GpuTensor| -> HipResult<GpuTensor> {
+            .ok_or_else(|| hip_bridge::HipError::new(0, "lane view Q8 stride overflow"))?;
+        let k_bytes_per_pos = if fwht3 {
+            self.n_kv_heads
+                .checked_mul(4 + (self.head_dim * 3) / 8)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "lane view FWHT3 stride overflow"))?
+        } else {
+            q8_bytes_per_pos
+        };
+        let view = |t: &GpuTensor, bytes_per_pos: usize, label: &str| -> HipResult<GpuTensor> {
             if t.numel() <= 1 {
                 // Filtered placeholder layer — keep a non-owning alias.
                 return Ok(t.shallow_clone());
             }
+            let byte_offset = lane
+                .checked_mul(lane_capacity)
+                .and_then(|n| n.checked_mul(bytes_per_pos))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "lane view byte_offset overflow"))?;
+            let lane_bytes = lane_capacity
+                .checked_mul(bytes_per_pos)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "lane view lane_bytes overflow"))?;
+            let lane_elems = Self::bytes_to_f32_elems(label, lane_bytes)?;
             let parent_bytes = t.buf.size();
             let end = byte_offset.checked_add(lane_bytes).ok_or_else(|| {
                 hip_bridge::HipError::new(0, "q8_lane_view parent byte range overflow")
@@ -940,7 +960,7 @@ impl KvCache {
             if end > parent_bytes {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "q8_lane_view lane byte range exceeds parent buffer",
+                    "lane view byte range exceeds parent buffer",
                 ));
             }
             let ptr =
@@ -951,8 +971,16 @@ impl KvCache {
                 dtype: DType::F32,
             })
         };
-        let k_gpu = self.k_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
-        let v_gpu = self.v_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
+        let k_gpu = self
+            .k_gpu
+            .iter()
+            .map(|t| view(t, k_bytes_per_pos, "continuous batch K lane"))
+            .collect::<HipResult<Vec<_>>>()?;
+        let v_gpu = self
+            .v_gpu
+            .iter()
+            .map(|t| view(t, q8_bytes_per_pos, "continuous batch V lane"))
+            .collect::<HipResult<Vec<_>>>()?;
         Ok(Self {
             k_gpu,
             v_gpu,
@@ -964,16 +992,16 @@ impl KvCache {
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
             quantized: true,
-            quant_q8: true,
+            quant_q8: q8,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
-            quant_asym3: false,
+            quant_asym3: fwht3,
             quant_asym2: false,
             boundary_layers: self.boundary_layers,
-            givens_cos: None,
-            givens_sin: None,
-            quant_fwht: false,
+            givens_cos: self.givens_cos.as_ref().map(GpuTensor::shallow_clone),
+            givens_sin: self.givens_sin.as_ref().map(GpuTensor::shallow_clone),
+            quant_fwht: fwht3,
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
@@ -1100,7 +1128,6 @@ impl KvCache {
             )),
         }
     }
-
 }
 
 impl KvCache {
@@ -3480,7 +3507,12 @@ impl KvCache {
             "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3500,7 +3532,12 @@ impl KvCache {
             "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3908,7 +3945,6 @@ impl KvCache {
     // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
     // — Stage 6 forward dispatch reads from the per-device replicas in
     // `Gpus` instead.
-
 }
 
 /// KV VMM-layout and adaptive-reset contract tests.
@@ -3985,7 +4021,6 @@ mod vmm_layout_tests {
             physical_cap: Some(physical_cap),
         }
     }
-
 
     #[test]
     fn fwht3_vmm_layout_matches_asym3_byte_geometry() {

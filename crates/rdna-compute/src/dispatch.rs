@@ -3195,13 +3195,11 @@ impl Gpu {
         // header bodies and strips the #includes. We mirror that exactly so
         // the hash matches and the runtime re-uses our cached .hsaco.
         //
-        // asym3 (SP1) additionally #includes "kv_slot_desc.h" — mirror
-        // ensure_givens4_kernel's conditional handling (only sources that
-        // actually contain the directive get it stripped/prepended) so the
-        // other assemble_asym callers (asym2/asym4/fwht2/fwht3/fwht4), which
-        // don't include it, keep producing byte-identical source to what the
-        // runtime compiles for them, and only asym3's precompiled hash grows
-        // to include the header.
+        // Multi-slot asym3 and FWHT3 kernels additionally include
+        // "kv_slot_desc.h". Mirror ensure_givens4_kernel's conditional
+        // handling so only sources that contain the directive have it
+        // stripped/prepended; all other assemble_asym callers keep producing
+        // byte-identical source to what the runtime compiles for them.
         let assemble_asym = |body: &str| -> String {
             let needs_kv_slot_desc = body.contains("#include \"kv_slot_desc.h\"");
             let stripped = body

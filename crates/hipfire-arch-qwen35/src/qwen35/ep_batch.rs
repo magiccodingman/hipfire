@@ -1799,6 +1799,10 @@ impl Qwen35DecodeBatchEpState {
                             positions,
                             lane_capacity: self.lane_capacity,
                             active_mask,
+                            kv_mode: rank_state.kv_mode,
+                            attention_path: rank_state.attention_path,
+                            slot_descs: &rank_state.slot_descs,
+                            row_slot: &rank_state.row_slot,
                         },
                     )?;
                 }
