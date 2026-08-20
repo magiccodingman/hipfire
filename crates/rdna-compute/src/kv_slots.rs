@@ -19,8 +19,8 @@
 /// on gfx1151 and gfx1201. Q8_0 K and V share a stride, so a slot sits at the
 /// same offset in both arenas and the constraint is free to honour.
 ///
-/// asym3 is exempt and must keep both bases: its K and V strides genuinely
-/// differ (3-bit rotated K against Q8_0 V).
+/// asym3 and FWHT3 are exempt and must keep both bases: their K and V strides
+/// genuinely differ (3-bit rotated K against Q8_0 V).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvSlotDesc {

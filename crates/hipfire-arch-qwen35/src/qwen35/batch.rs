@@ -5,24 +5,25 @@
 //! Qwen3.5 continuous-batch state: `PrefillBatchScratch`, `Qwen35DecodeBatchState`,
 //! lane-mask helpers, and the independent-lane batched decode entry points.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
-use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
 use super::prefill::moe_grouped_m_total_max;
+use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::llama;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::WeightTensor;
+use rdna_compute::kv_slots::KvSlotDesc;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// Per-layer batched intermediates used by `forward_prefill_batch`. Each
 /// row is one token in the batch; rows are contiguous [N × K] blocks so
@@ -470,18 +471,107 @@ impl PrefillBatchScratch {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen35BatchKvMode {
+    Q8,
+    Fwht3,
+}
+
+impl Qwen35BatchKvMode {
+    pub fn from_cache(cache: &llama::KvCache) -> Self {
+        if cache.quant_fwht && cache.quant_asym3 && cache.v_mode == llama::VMode::Q8 {
+            Self::Fwht3
+        } else {
+            Self::Q8
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen35BatchAttentionPath {
+    Q8IndependentLds,
+    TiledFlash,
+}
+
+pub fn qwen35_batch_attention_path(
+    mode: Qwen35BatchKvMode,
+    lane_capacity: usize,
+    q8_lds_lane_capacity: usize,
+) -> Qwen35BatchAttentionPath {
+    if mode == Qwen35BatchKvMode::Q8 && lane_capacity <= q8_lds_lane_capacity {
+        Qwen35BatchAttentionPath::Q8IndependentLds
+    } else {
+        Qwen35BatchAttentionPath::TiledFlash
+    }
+}
+
+fn batch_slot_descs(
+    mode: Qwen35BatchKvMode,
+    max_batch: usize,
+    lane_capacity: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> HipResult<Vec<KvSlotDesc>> {
+    let q8_bytes_per_pos = n_kv_heads
+        .checked_mul(head_dim / 32)
+        .and_then(|v| v.checked_mul(34))
+        .ok_or_else(|| HipError::new(0, "batch slot Q8 stride overflow"))?;
+    let k_bytes_per_pos = match mode {
+        Qwen35BatchKvMode::Q8 => q8_bytes_per_pos,
+        Qwen35BatchKvMode::Fwht3 => n_kv_heads
+            .checked_mul(4 + (head_dim * 3) / 8)
+            .ok_or_else(|| HipError::new(0, "batch slot FWHT3 stride overflow"))?,
+    };
+    let cap = i32::try_from(lane_capacity)
+        .map_err(|_| HipError::new(0, "batch lane capacity exceeds i32"))?;
+    (0..max_batch)
+        .map(|lane| {
+            let token_base = lane
+                .checked_mul(lane_capacity)
+                .ok_or_else(|| HipError::new(0, "batch slot token base overflow"))?;
+            let k_base = token_base
+                .checked_mul(k_bytes_per_pos)
+                .ok_or_else(|| HipError::new(0, "batch slot K base overflow"))?;
+            let v_base = token_base
+                .checked_mul(q8_bytes_per_pos)
+                .ok_or_else(|| HipError::new(0, "batch slot V base overflow"))?;
+            Ok(KvSlotDesc {
+                k_base: k_base as u64,
+                v_base: v_base as u64,
+                seq_len: cap,
+                cap,
+            })
+        })
+        .collect()
+}
+
+fn slot_desc_bytes(descs: &[KvSlotDesc]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(descs));
+    for desc in descs {
+        bytes.extend_from_slice(&desc.k_base.to_ne_bytes());
+        bytes.extend_from_slice(&desc.v_base.to_ne_bytes());
+        bytes.extend_from_slice(&desc.seq_len.to_ne_bytes());
+        bytes.extend_from_slice(&desc.cap.to_ne_bytes());
+    }
+    bytes
+}
+
 /// Persistent fixed-slot state for independent-sequence Qwen3.5 decode.
 ///
 /// Weights remain shared through [`Qwen35Weights`].  Only mutable sequence
-/// state is multiplied by `max_batch`: Q8 KV, Q8 DeltaNet matrices, conv rings,
-/// and the reusable batched scratch/logit buffers.  V1 intentionally uses Q8
-/// KV/state because those are the production decode defaults and the first
-/// independent attention/recurrent kernels target their exact layouts.
+/// state is multiplied by `max_batch`: KV, Q8 DeltaNet matrices, conv rings,
+/// and the reusable batched scratch/logit buffers. Q8 lanes retain the original
+/// LDS attention fast path when they fit; long Q8 lanes and FWHT3 lanes use the
+/// bounded-LDS tiled flash path through fixed slot descriptors.
 pub struct Qwen35DecodeBatchState {
     pub max_batch: usize,
     pub lane_capacity: usize,
     pub sample_repeat_capacity: usize,
+    pub kv_mode: Qwen35BatchKvMode,
+    pub attention_path: Qwen35BatchAttentionPath,
     pub kv_cache: llama::KvCache,
+    pub slot_descs: GpuTensor,
+    pub row_slot: GpuTensor,
     pub dn_state: DeltaNetState,
     pub pbs: PrefillBatchScratch,
     pub final_hidden: GpuTensor,
@@ -501,16 +591,40 @@ impl Qwen35DecodeBatchState {
         lane_capacity: usize,
         sample_repeat_capacity: usize,
     ) -> HipResult<Self> {
+        Self::new_with_kv_mode(
+            gpu,
+            config,
+            max_batch,
+            lane_capacity,
+            sample_repeat_capacity,
+            Qwen35BatchKvMode::Q8,
+        )
+    }
+
+    pub fn new_with_kv_mode(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        lane_capacity: usize,
+        sample_repeat_capacity: usize,
+        kv_mode: Qwen35BatchKvMode,
+    ) -> HipResult<Self> {
         if max_batch == 0 || lane_capacity == 0 || sample_repeat_capacity == 0 {
             return Err(HipError::new(
                 0,
                 "decode batch size, lane capacity, and repeat capacity must be non-zero",
             ));
         }
-        // Fail closed before any GPU allocation: independent Q8 attention's
-        // dynamic LDS is O(lane_capacity). Cap that the kernel cannot launch
-        // must not be admitted into DecodeBatchState.
-        gpu.ensure_attention_q8_0_kv_independent_lds(lane_capacity, config.head_dim)?;
+        if max_batch > u64::BITS as usize {
+            return Err(HipError::new(0, "decode batch size exceeds 64-lane mask"));
+        }
+        let q8_lds_lane_capacity =
+            gpu.attention_q8_0_kv_independent_max_lane_capacity(config.head_dim);
+        let attention_path =
+            qwen35_batch_attention_path(kv_mode, lane_capacity, q8_lds_lane_capacity);
+        if attention_path == Qwen35BatchAttentionPath::Q8IndependentLds {
+            gpu.ensure_attention_q8_0_kv_independent_lds(lane_capacity, config.head_dim)?;
+        }
         let total_capacity = max_batch
             .checked_mul(lane_capacity)
             .ok_or_else(|| HipError::new(0, "decode batch KV capacity multiplication overflow"))?;
@@ -524,6 +638,14 @@ impl Qwen35DecodeBatchState {
             .iter()
             .map(|t| *t == LayerType::FullAttention)
             .collect();
+        let descs = batch_slot_descs(
+            kv_mode,
+            max_batch,
+            lane_capacity,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
+        let desc_bytes = slot_desc_bytes(&descs);
 
         // GpuTensor / KvCache / DeltaNetState / PrefillBatchScratch have no
         // freeing Drop (free needs &mut Gpu). A mid-`new` `?` would leak every
@@ -532,13 +654,22 @@ impl Qwen35DecodeBatchState {
         // through a ledger of non-owning aliases (same pattern as
         // PrefillBatchScratch::new_opt): on error free aliases + compound
         // owners before propagating; on success aliases drop as no-ops.
-        let kv_cache = llama::KvCache::new_gpu_q8_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            total_capacity,
-        )?;
+        let kv_cache = match kv_mode {
+            Qwen35BatchKvMode::Q8 => llama::KvCache::new_gpu_q8_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                total_capacity,
+            )?,
+            Qwen35BatchKvMode::Fwht3 => llama::KvCache::new_gpu_fwht3_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                total_capacity,
+            )?,
+        };
         let dn_state =
             match DeltaNetState::new_batched_with_quant(gpu, config, StateQuant::Q8, max_batch) {
                 Ok(s) => s,
@@ -556,10 +687,10 @@ impl Qwen35DecodeBatchState {
             }
         };
 
-        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(7);
-        macro_rules! zeros {
-            ($shape:expr) => {
-                match gpu.zeros($shape, DType::F32) {
+        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(9);
+        macro_rules! alloc {
+            ($shape:expr, $dtype:expr) => {
+                match gpu.zeros($shape, $dtype) {
                     Ok(t) => {
                         // SAFETY: alias lives only inside `new`. On error it is
                         // freed below (original field drops without freeing);
@@ -576,7 +707,7 @@ impl Qwen35DecodeBatchState {
                         for prev in ledger.drain(..) {
                             let _ = gpu.free_tensor(prev);
                         }
-                        pbs.free_gpu(gpu);
+                        let _ = pbs.free_gpu(gpu);
                         dn_state.free_gpu(gpu);
                         let _ = kv_cache.free_gpu(gpu);
                         return Err(e);
@@ -585,18 +716,42 @@ impl Qwen35DecodeBatchState {
             };
         }
 
-        let final_hidden = zeros!(&[max_batch * config.dim]);
-        let logits = zeros!(&[max_batch * config.vocab_size]);
-        let lm_rot = zeros!(&[max_batch * config.dim]);
-        let sample_out = zeros!(&[max_batch * 2]);
-        let sample_repeat_tokens = zeros!(&[repeat_tokens_len]);
-        let sample_repeat_lengths = zeros!(&[max_batch]);
-        let sample_rng_states = zeros!(&[max_batch]);
+        let slot_descs = alloc!(&[desc_bytes.len()], DType::Raw);
+        let row_slot = alloc!(&[max_batch * 4], DType::Raw);
+        let row_slot_host: Vec<i32> = (0..max_batch).map(|lane| lane as i32).collect();
+        let row_slot_bytes = unsafe {
+            std::slice::from_raw_parts(row_slot_host.as_ptr() as *const u8, max_batch * 4)
+        };
+        if let Err(e) = gpu
+            .hip
+            .memcpy_htod(&slot_descs.buf, &desc_bytes)
+            .and_then(|_| gpu.hip.memcpy_htod(&row_slot.buf, row_slot_bytes))
+        {
+            for prev in ledger.drain(..) {
+                let _ = gpu.free_tensor(prev);
+            }
+            let _ = pbs.free_gpu(gpu);
+            dn_state.free_gpu(gpu);
+            let _ = kv_cache.free_gpu(gpu);
+            return Err(e);
+        }
+
+        let final_hidden = alloc!(&[max_batch * config.dim], DType::F32);
+        let logits = alloc!(&[max_batch * config.vocab_size], DType::F32);
+        let lm_rot = alloc!(&[max_batch * config.dim], DType::F32);
+        let sample_out = alloc!(&[max_batch * 2], DType::F32);
+        let sample_repeat_tokens = alloc!(&[repeat_tokens_len], DType::F32);
+        let sample_repeat_lengths = alloc!(&[max_batch], DType::F32);
+        let sample_rng_states = alloc!(&[max_batch], DType::F32);
         Ok(Self {
             max_batch,
             lane_capacity,
             sample_repeat_capacity,
+            kv_mode,
+            attention_path,
             kv_cache,
+            slot_descs,
+            row_slot,
             dn_state,
             pbs,
             final_hidden,
@@ -639,7 +794,9 @@ impl Qwen35DecodeBatchState {
         config: &Qwen35Config,
         lane: usize,
     ) -> HipResult<()> {
-        let mut kv_lane = self.kv_cache.q8_lane_view(lane, self.lane_capacity)?;
+        let mut kv_lane = self
+            .kv_cache
+            .continuous_batch_lane_view(lane, self.lane_capacity)?;
         kv_lane.clear_gpu(gpu)?;
         let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
         dn_lane.reset(gpu)?;
@@ -707,7 +864,9 @@ impl Qwen35DecodeBatchState {
                 ),
             ));
         }
-        let mut kv_lane = self.kv_cache.q8_lane_view(lane, self.lane_capacity)?;
+        let mut kv_lane = self
+            .kv_cache
+            .continuous_batch_lane_view(lane, self.lane_capacity)?;
         let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
         forward_prefill_batch(
             gpu,
@@ -952,6 +1111,8 @@ impl Qwen35DecodeBatchState {
         note(self.kv_cache.free_gpu(gpu));
         self.dn_state.free_gpu(gpu);
         note(self.pbs.free_gpu(gpu));
+        note(gpu.free_tensor(self.slot_descs));
+        note(gpu.free_tensor(self.row_slot));
         note(gpu.free_tensor(self.final_hidden));
         note(gpu.free_tensor(self.logits));
         note(gpu.free_tensor(self.lm_rot));
@@ -1256,6 +1417,10 @@ pub(crate) enum BatchSemantics<'a> {
         positions: &'a [usize],
         lane_capacity: usize,
         active_mask: u64,
+        kv_mode: Qwen35BatchKvMode,
+        attention_path: Qwen35BatchAttentionPath,
+        slot_descs: &'a GpuTensor,
+        row_slot: &'a GpuTensor,
     },
 }
 
@@ -1565,10 +1730,50 @@ pub fn forward_decode_batch_prepared(
             positions,
             lane_capacity: state.lane_capacity,
             active_mask,
+            kv_mode: state.kv_mode,
+            attention_path: state.attention_path,
+            slot_descs: &state.slot_descs,
+            row_slot: &state.row_slot,
         },
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);
     let lm_rot = state.lm_rot.sub_offset(0, n * config.dim);
     lm_head_batched(gpu, &weights.output, &final_hidden, &lm_rot, &logits, n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_q8_and_all_fwht3_lanes_use_bounded_tiled_attention() {
+        let lds_cap = 15_872;
+        assert_eq!(
+            qwen35_batch_attention_path(Qwen35BatchKvMode::Q8, lds_cap, lds_cap),
+            Qwen35BatchAttentionPath::Q8IndependentLds
+        );
+        assert_eq!(
+            qwen35_batch_attention_path(Qwen35BatchKvMode::Q8, 32_768, lds_cap),
+            Qwen35BatchAttentionPath::TiledFlash
+        );
+        assert_eq!(
+            qwen35_batch_attention_path(Qwen35BatchKvMode::Fwht3, 32_768, lds_cap),
+            Qwen35BatchAttentionPath::TiledFlash
+        );
+    }
+
+    #[test]
+    fn fwht3_slot_descriptors_keep_distinct_k_and_v_lane_strides() {
+        let descs = batch_slot_descs(Qwen35BatchKvMode::Fwht3, 4, 32_768, 4, 256)
+            .expect("valid Qwen FWHT3 slot geometry");
+        assert_eq!(descs.len(), 4);
+        assert_eq!(descs[0].k_base, 0);
+        assert_eq!(descs[0].v_base, 0);
+        assert_eq!(descs[1].k_base, 32_768 * 400);
+        assert_eq!(descs[1].v_base, 32_768 * 1_088);
+        assert_eq!(descs[3].seq_len, 32_768);
+        assert_eq!(descs[3].cap, 32_768);
+        assert_eq!(slot_desc_bytes(&descs).len(), 4 * 24);
+    }
 }

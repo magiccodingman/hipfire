@@ -12,6 +12,7 @@
 // LDS: (head_dim + 32) * 4 bytes.
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
+#include "kv_slot_desc.h"
 
 extern "C" __global__ void kv_cache_write_asym_k_fwht3_batched(
     unsigned char* __restrict__ k_dst,
@@ -21,7 +22,9 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht3_batched(
     const float* __restrict__ signs2,
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    const KvSlotDesc* __restrict__ slot_descs,
+    const int* __restrict__ row_slot
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
@@ -32,6 +35,10 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht3_batched(
     const int kv_dim = n_kv_heads * head_dim;
     const int bytes_per_head = 4 + (head_dim * 3) / 8;
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    const int slot = (row_slot != nullptr) ? row_slot[bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
 
     extern __shared__ float smem[];
     float* x = smem;
@@ -78,7 +85,8 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht3_batched(
     float recon_norm = sqrtf(scratch[0]);
     float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
 
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out = k_dst + kv_offset_for_k(desc, pos, bytes_per_pos)
+                       + h * bytes_per_head;
     if (tid == 0) *(float*)out = cnorm;
 
     unsigned int packed = 0;

@@ -4331,6 +4331,30 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_fwht3_vec_batched_slots(
+            dst, src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, None, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht3_vec_batched_slots(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "FWHT3 batched KV slot descriptors and row slots are both-or-neither"
+        );
         self.bind_thread()?;
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_fwht3_batched",
@@ -4345,6 +4369,14 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut row_slot_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut kdp as *mut _ as *mut c_void,
             &mut ksp as *mut _ as *mut c_void,
@@ -4354,6 +4386,8 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut row_slot_ptr as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
         self.launch_maybe_blob(
@@ -4372,6 +4406,8 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(row_slot_ptr);
                 b
             },
         )
@@ -4961,12 +4997,12 @@ impl Gpu {
         // `desc` off `slot_descs`, so that combination would silently pin
         // every row to slot 0's descriptor while still running the
         // descriptor addressing path. Pushed unconditionally as the last two
-        // non-WMMA kernargs below for every caller of this launcher; only
-        // the q8 and asym3 tile kernels declare trailing parameters for them
-        // today (see the assertion below for the WMMA exclusion) — every
-        // other tile kernel routed through here (fwht/lloyd/asym2/asym4)
-        // simply has fewer declared params and ignores the extra trailing
-        // kernarg bytes, the same way they already ignore `window`.
+        // non-WMMA kernargs below for every caller of this launcher. The q8,
+        // asym3, and fwht3 tile kernels declare trailing parameters for them
+        // today (see the assertion below for the WMMA exclusion). Other tile
+        // kernels routed through here simply have fewer declared params and
+        // ignore the extra trailing kernarg bytes, the same way they already
+        // ignore `window`.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
@@ -5903,12 +5939,10 @@ impl Gpu {
         batch_size: usize,
         v_mode_bits: i32,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.kv_cache_write_fwht3_vec_batched(
-            k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size,
-        )?;
-        self.kv_write_v_by_mode_batched(
+        self.kv_cache_write_fwht3_batched_slots(
+            k_dst,
             v_dst,
+            k_src,
             v_src,
             positions,
             signs1,
@@ -5917,7 +5951,59 @@ impl Gpu {
             head_dim,
             batch_size,
             v_mode_bits,
+            None,
+            None,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht3_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        v_mode_bits: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "FWHT3 batched KV slot descriptors and row slots are both-or-neither"
+        );
+        self.bind_thread()?;
+        self.kv_cache_write_fwht3_vec_batched_slots(
+            k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, slot_descs,
+            row_slot,
+        )?;
+        if v_mode_bits == V_MODE_Q8 {
+            self.kv_cache_write_q8_0_batched_slots(
+                v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            )
+        } else {
+            assert!(
+                slot_descs.is_none(),
+                "slot-aware FWHT3 batched write currently requires Q8 V"
+            );
+            self.kv_write_v_by_mode_batched(
+                v_dst,
+                v_src,
+                positions,
+                signs1,
+                signs2,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                v_mode_bits,
+            )
+        }
     }
 
     /// Batched flash attention for asym3 KV.
@@ -6140,6 +6226,54 @@ impl Gpu {
         block_cols: usize,
         v_mode_bits: i32,
     ) -> HipResult<()> {
+        self.attention_flash_fwht3_batched_masked_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            v_mode_bits,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht3_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        v_mode_bits: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_fwht3_tile_batched",
@@ -6165,8 +6299,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
-            None,
-            None,
+            slot_descs,
+            row_slot,
         )
     }
 
@@ -14699,7 +14833,23 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::{q8_flash_default_tile_size, replay_stable_tile_count};
+    use super::{
+        attention_q8_0_kv_independent_lds_bytes, attention_q8_0_kv_independent_max_lane_capacity,
+        q8_flash_default_tile_size, replay_stable_tile_count,
+    };
+
+    #[test]
+    fn independent_q8_gfx12_64k_lds_limit_is_exactly_15872_at_hd256() {
+        assert_eq!(
+            attention_q8_0_kv_independent_lds_bytes(15_872, 256),
+            64 * 1024
+        );
+        assert!(attention_q8_0_kv_independent_lds_bytes(15_873, 256) > 64 * 1024);
+        assert_eq!(
+            attention_q8_0_kv_independent_max_lane_capacity(64 * 1024, 256),
+            15_872
+        );
+    }
 
     #[test]
     fn q8_flash_gfx12_small_dense_shape_uses_tile16_only() {
